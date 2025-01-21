@@ -3,14 +3,10 @@ import json
 import os
 import sys
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, TypedDict, List, Literal, NotRequired, Union
 import psycopg
 
-SPEC_PATH = [
-    "/home/pgedge/db.json",
-    "/home/pgedge/node.secret.json",
-    "/home/pgedge/node.spec.json",
-]
+CLUSTER_CONF_FILE = "/home/pgedge/db.json"
 
 PG_CONF_FILE = "/data/pgdata/postgresql.conf"
 
@@ -49,13 +45,38 @@ SUPERUSER_PARAMETERS = ", ".join(
 )
 
 
-def read_spec() -> dict[str, Any]:
-    for path in SPEC_PATH:
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
-    raise FileNotFoundError("spec not found")
+class NodeSpec(TypedDict):
+    id: str
+    name: str
+    region: str
+    hostname: str
+    internal_hostname: NotRequired[str]  # 为了向后兼容
 
+
+class UserSpec(TypedDict):
+    username: str
+    password: str
+    superuser: NotRequired[bool]
+    service: Literal["postgres", "pgcat"]
+    type: Literal["application", "admin", "internal_admin", "pooler_auth", "other"]
+
+
+class DatabaseSpec(TypedDict):
+    name: str
+    id: NotRequired[str]
+    port: NotRequired[int]
+    options: NotRequired[List[str]]
+    nodes: List[NodeSpec]
+    users: List[UserSpec]
+    mode: NotRequired[str]
+    self: NotRequired[NodeSpec]  # optional self reference
+
+
+def read_config() -> DatabaseSpec:
+    if not os.path.exists(CLUSTER_CONF_FILE):
+        raise FileNotFoundError("spec not found")
+    with open(CLUSTER_CONF_FILE) as f:
+        return json.load(f)
 
 def info(*args):
     print("**** pgEdge:", *args, "****")
@@ -274,7 +295,7 @@ class DatabaseInfo:
     pgedge_pw: str
 
 
-def get_db_info(spec) -> DatabaseInfo:
+def get_db_info(spec: DatabaseSpec) -> DatabaseInfo:
     database_name = spec.get("name")
     if not database_name:
         info("ERROR: database name not found in spec")
@@ -344,7 +365,7 @@ def get_db_info(spec) -> DatabaseInfo:
         mode=spec.get("mode", "online"),
     )
 
-def init_online_mode(db_info):
+def init_online_mode(db_info: DatabaseInfo):
     # Give Postgres a moment to start
     time.sleep(3)
 
@@ -487,7 +508,7 @@ def init_spock_node(db_info: DatabaseInfo, schemas: list[str]):
 def main():
     # The spec contains the desired settings
     try:
-        spec = read_spec()
+        spec = read_config()
     except FileNotFoundError:
         info("ERROR: spec not found, skipping initialization")
         sys.exit(1)

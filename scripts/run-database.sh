@@ -34,6 +34,7 @@ if [[ -f "/home/pgedge/db.json" ]]; then
 fi
 
 NODE_NAME=${NODE_NAME:-n1}
+NODE_ID=${NODE_ID:-1}
 
 # Initialize users and subscriptions in the background if there was a spec
 if [[ -n "${SPEC_PATH}" ]]; then
@@ -43,7 +44,12 @@ if [[ -n "${SPEC_PATH}" ]]; then
         NAME=$(jq -r ".name" "${SPEC_PATH}")
         echo "**** pgEdge: database name is ${NAME} ****"
         echo "cron.database_name = '${NAME}'" >>${PGCONF}
-        SNOWFLAKE_NODE=$(echo ${NODE_NAME} | sed "s/[^0-9]*//g") # n3 -> 3
+        # If NODE_ID is set, use it as the snowflake node id
+        if [[ -n "${NODE_ID}" ]]; then
+            SNOWFLAKE_NODE=${NODE_ID}
+        else
+            SNOWFLAKE_NODE=$(echo ${NODE_NAME} | sed "s/[^0-9]*//g")
+        fi
         echo "snowflake.node = ${SNOWFLAKE_NODE}" >>${PGCONF}
         echo "**** pgEdge: snowflake.node = ${SNOWFLAKE_NODE} ****"
 
