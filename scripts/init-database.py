@@ -173,7 +173,7 @@ def get_superuser_roles() -> str:
                 "pg_checkpoint",
             ]
         )
-    elif pg_version == "16":
+    elif pg_version in ["16", "17"]:
         return ", ".join(
             [
                 "pg_read_all_data",

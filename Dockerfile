@@ -60,9 +60,9 @@ ENV INIT_DATABASE=${INIT_DATABASE}
 ENV INIT_PASSWORD=${INIT_PASSWORD}
 
 # Postgres verion to install
-ARG PGV="16"
+ARG PGV="17"
 ARG PGEDGE_INSTALL_URL="https://pgedge-download.s3.amazonaws.com/REPO/install.py"
-ARG SPOCK_VERSION="3.3.6"
+ARG SPOCK_VERSION="4.0.9-1"
 
 # Install pgEdge Postgres binaries and pgvector
 ENV PGV=${PGV}
@@ -72,7 +72,7 @@ ENV PATH="/opt/pgedge/pg${PGV}/bin:/opt/pgedge:${PATH}"
 ADD --chmod=777 ${PGEDGE_INSTALL_URL} install.py
 RUN python3 install.py
 RUN rm install.py
-RUN ./pgedge/pgedge setup -U ${INIT_USERNAME} -d ${INIT_DATABASE} -P ${INIT_PASSWORD} --pg ${PGV} --spock_ver ${SPOCK_VERSION} -p 5432 \ 
+RUN ./pgedge/pgedge setup -U ${INIT_USERNAME} -d ${INIT_DATABASE} -P ${INIT_PASSWORD} --pg_ver=${PGV} --spock_ver=${SPOCK_VERSION} --port=5432 \ 
     && ./pgedge/pgedge um install vector \
     && ./pgedge/pgedge um install postgis \
     && pg_ctl stop -t 60 --wait
