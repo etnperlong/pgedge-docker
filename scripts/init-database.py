@@ -5,6 +5,7 @@ import sys
 import time
 from typing import Any, Optional, Tuple, TypedDict, List, Literal, NotRequired, Union
 import psycopg
+from psycopg import Cursor
 
 CLUSTER_CONF_FILE = "/home/pgedge/db.json"
 
@@ -49,8 +50,8 @@ class NodeSpec(TypedDict):
     id: str
     name: str
     region: str
-    hostname: str
-    internal_hostname: NotRequired[str]  # 为了向后兼容
+    hostname: NotRequired[str]
+    internal_hostname: NotRequired[str]  # For backwards compatibility.
 
 
 class UserSpec(TypedDict):
@@ -61,7 +62,7 @@ class UserSpec(TypedDict):
     type: Literal["application", "admin", "internal_admin", "pooler_auth", "other"]
 
 
-class DatabaseSpec(TypedDict):
+class ClusterSpec(TypedDict):
     name: str
     id: NotRequired[str]
     port: NotRequired[int]
@@ -72,13 +73,13 @@ class DatabaseSpec(TypedDict):
     self: NotRequired[NodeSpec]  # optional self reference
 
 
-def read_config() -> DatabaseSpec:
+def read_config() -> ClusterSpec:
     if not os.path.exists(CLUSTER_CONF_FILE):
         raise FileNotFoundError("spec not found")
     with open(CLUSTER_CONF_FILE) as f:
         return json.load(f)
 
-def info(*args):
+def info(*args) -> None:
     print("**** pgEdge:", *args, "****")
     sys.stdout.flush()
 
@@ -133,7 +134,7 @@ def wait_for_spock_node(dsn: str):
                     time.sleep(2)
 
 
-def spock_sub_create(cursor, sub_name: str, other_dsn: str):
+def spock_sub_create(cursor: Cursor, sub_name: str, other_dsn: str):
     forward_origins = "{}"
     replication_sets = "{default, default_insert_only, ddl_sql}"
     sub_create = f"""
@@ -155,7 +156,7 @@ def spock_sub_create(cursor, sub_name: str, other_dsn: str):
             info("waiting for subscription to work...", exc)
             time.sleep(2)
 
-def spock_sub_drop(cursor, sub_name: str):
+def spock_sub_drop(cursor: Cursor, sub_name: str):
     sub_drop_if_exists = f"""
     SELECT spock.sub_drop(
         subscription_name := '{sub_name}',
@@ -213,7 +214,7 @@ def get_superuser_roles() -> str:
         raise ValueError(f"unrecognized postgres version: '{pg_version}'")
 
 
-def create_user_statement(user) -> list[str]:
+def create_user_statement(user: UserSpec) -> list[str]:
     username = user["username"]
     password = user["password"]
     superuser = user.get("superuser")
@@ -230,7 +231,7 @@ def create_user_statement(user) -> list[str]:
         return [f"CREATE USER {username} WITH LOGIN PASSWORD '{password}';"]
 
 
-def alter_user_statements(user, dbname: str, schemas: list[str]) -> list[str]:
+def alter_user_statements(user: UserSpec, dbname: str, schemas: list[str]) -> list[str]:
     name = user["username"]
     stmts = [f"GRANT CONNECT ON DATABASE {dbname} TO {name};"]
     if user["type"] in ["application_read_only", "internal_read_only", "pooler_auth"]:
@@ -256,21 +257,22 @@ def alter_user_statements(user, dbname: str, schemas: list[str]) -> list[str]:
         return stmts
 
 
-def get_self_node(spec):
+def get_self_node(spec: ClusterSpec) -> NodeSpec:
     nodes = spec["nodes"]
     # Use the self entry from the spec if there is one
     if "self" in spec:
         return spec["self"]
     node_name = os.getenv("NODE_NAME", "n1")
+    node_id = os.getenv("NODE_ID", "-1")
     # Find the node with that name
-    self_node = next((node for node in nodes if node["name"] == node_name), None)
+    self_node = next((node for node in nodes if node["id"] == node_id), None)
     if not self_node:
-        info(f"ERROR: node {node_name} not found in spec")
+        info(f"ERROR: node {node_id} (name: {node_name}) not found in spec")
         sys.exit(1)
     return self_node
 
 
-def get_hostname(node: dict) -> str:
+def get_hostname(node: NodeSpec) -> str:
     if "hostname" in node:
         return node["hostname"]
     # For backwards compatibility.
@@ -295,7 +297,7 @@ class DatabaseInfo:
     pgedge_pw: str
 
 
-def get_db_info(spec: DatabaseSpec) -> DatabaseInfo:
+def get_db_info(spec: ClusterSpec) -> DatabaseInfo:
     database_name = spec.get("name")
     if not database_name:
         info("ERROR: database name not found in spec")
@@ -365,7 +367,7 @@ def get_db_info(spec: DatabaseSpec) -> DatabaseInfo:
         mode=spec.get("mode", "online"),
     )
 
-def init_online_mode(db_info: DatabaseInfo):
+def init_online_mode(db_info: DatabaseInfo) -> None:
     # Give Postgres a moment to start
     time.sleep(3)
 
@@ -378,13 +380,13 @@ def init_online_mode(db_info: DatabaseInfo):
         init_database(db_info)
 
 
-def init_offline_mode():
+def init_offline_mode() -> None:
     info("mode offline configured, postgres will not start")
     while True:
         time.sleep(1)
 
 
-def init_database(db_info: DatabaseInfo):
+def init_database(db_info: DatabaseInfo) -> None:
     admin_username = get_admin_creds(db_info.postgres_users)[0]
 
     # Bootstrap users and the primary database by connecting to the "init"
@@ -439,7 +441,7 @@ def init_database(db_info: DatabaseInfo):
     info(f"database node initialized ({db_info.node_name})")
 
 
-def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = False):
+def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = False) -> None:
     peers = [node for node in db_info.nodes if node["name"] != db_info.node_name]
     with connect(db_info.local_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
@@ -459,7 +461,7 @@ def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = F
                 )
                 info("subscribed to peer:", peer["name"])
 
-def init_spock_node(db_info: DatabaseInfo, schemas: list[str]):
+def init_spock_node(db_info: DatabaseInfo, schemas: list[str]) -> None:
 
     with connect(db_info.internal_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
@@ -505,7 +507,7 @@ def init_spock_node(db_info: DatabaseInfo, schemas: list[str]):
                 cur.execute(statement)
 
 
-def main():
+def main() -> None:
     # The spec contains the desired settings
     try:
         spec = read_config()
