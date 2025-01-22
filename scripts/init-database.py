@@ -3,14 +3,12 @@ import json
 import os
 import sys
 import time
-from typing import Any, Optional, Tuple, TypedDict, List, Literal, NotRequired, Union
+from typing import Any, Optional, Tuple, TypedDict, List, Literal
 import psycopg
 from psycopg import Cursor
 
-CLUSTER_CONF_FILE = "/home/pgedge/db.json"
-
-PG_CONF_FILE = "/data/pgdata/postgresql.conf"
-
+CLUSTER_CONF_FILE = "/home/pgedge/cluster.json"
+INIT_STATUS_FILE = "/data/init-status.json"
 
 SUPERUSER_PARAMETERS = ", ".join(
     [
@@ -50,27 +48,30 @@ class NodeSpec(TypedDict):
     id: str
     name: str
     region: str
-    hostname: NotRequired[str]
-    internal_hostname: NotRequired[str]  # For backwards compatibility.
+    hostname: Optional[str]
+    internal_hostname: Optional[str]  # For backwards compatibility.
 
 
 class UserSpec(TypedDict):
     username: str
     password: str
-    superuser: NotRequired[bool]
+    superuser: Optional[bool]
     service: Literal["postgres", "pgcat"]
     type: Literal["application", "admin", "internal_admin", "pooler_auth", "other"]
 
-
+class DatabaseSpec(TypedDict):
+    name: str
+    owner: Optional[str]
 class ClusterSpec(TypedDict):
     name: str
-    id: NotRequired[str]
-    port: NotRequired[int]
-    options: NotRequired[List[str]]
+    id: Optional[str]
+    port: Optional[int]
+    options: Optional[List[str]]
     nodes: List[NodeSpec]
     users: List[UserSpec]
-    mode: NotRequired[str]
-    self: NotRequired[NodeSpec]  # optional self reference
+    mode: Optional[str]
+    self: Optional[NodeSpec]  # optional self reference
+    databases: List[DatabaseSpec] # Multiple databases supported
 
 
 def read_config() -> ClusterSpec:
@@ -78,6 +79,42 @@ def read_config() -> ClusterSpec:
         raise FileNotFoundError("spec not found")
     with open(CLUSTER_CONF_FILE) as f:
         return json.load(f)
+
+class InitStatus(TypedDict):
+    default_db_initialized: bool
+    dbs_initialized: List[str]
+
+def read_init_status():
+    # Force update from enviroment
+    force_update = os.getenv("FORCE_INIT", "false").lower() == "true"
+    if force_update:
+        info("WARNING: FORCE_INIT is set, forcing init status update")
+        return {"default_db_initialized": False, "dbs_initialized": []}
+    if not os.path.exists(INIT_STATUS_FILE):
+        return {"default_db_initialized": False, "dbs_initialized": []}
+    with open(INIT_STATUS_FILE) as f:
+        # If not a valid json, return empty
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {"default_db_initialized": False, "dbs_initialized": []}
+    
+def update_database_init_status(database_name: str, initialized: bool) -> None:
+    init_status = read_init_status()
+    if initialized:
+        if database_name not in init_status["dbs_initialized"]:
+            init_status["dbs_initialized"].append(database_name)
+    else:
+        if database_name in init_status["dbs_initialized"]:
+            init_status["dbs_initialized"].remove(database_name)
+    with open(INIT_STATUS_FILE, "w") as f:
+        json.dump(init_status, f)
+
+def update_default_db_init_status(initialized: bool) -> None:
+    init_status = read_init_status()
+    init_status["default_db_initialized"] = initialized
+    with open(INIT_STATUS_FILE, "w") as f:
+        json.dump(init_status, f)
 
 def info(*args) -> None:
     print("**** pgEdge:", *args, "****")
@@ -178,7 +215,6 @@ def get_admin_creds(postgres_users: dict[str, Any]) -> Tuple[str, str]:
         if user.get("service") == "postgres" and user["type"] == "admin":
             return user["username"], user["password"]
     return "", ""
-
 
 def get_superuser_roles() -> str:
     pg_version = os.getenv("PGV")
@@ -282,17 +318,19 @@ def get_hostname(node: NodeSpec) -> str:
 @dataclass
 class DatabaseInfo:
     database_name: str
+    owner: str
     hostname: str
     mode: Optional[str]
     nodes: list[NodeSpec]
+    node_id: str
     node_name: str
     postgres_users: dict[str, Any]
     spock_dsn: str
     local_dsn: str
     internal_dsn: str
-    init_dsn: str
-    init_username: str
-    init_dbname: str
+    init_dsn: Optional[str]
+    init_username: Optional[str]
+    init_dbname: Optional[str]
     pgedge_pw: str
 
 
@@ -316,6 +354,7 @@ def get_default_db_info(spec: ClusterSpec) -> DatabaseInfo:
     self_node = get_self_node(spec)
     hostname = get_hostname(self_node)
     node_name = self_node["name"]
+    node_id = self_node["id"]
     postgres_users = dict(
         (user["username"], user) for user in users if user["service"] == "postgres"
     )
@@ -334,7 +373,7 @@ def get_default_db_info(spec: ClusterSpec) -> DatabaseInfo:
         sys.exit(1)
 
     # This DSN will be used for Spock subscriptions
-    spock_dsn = dsn(dbname=default_db_name, user="pgedge", host=hostname)
+    spock_dsn = dsn(dbname=default_db_name, user="pgedge", host=hostname, pw=pgedge_pw)
 
     # This DSN will be used for the admin connection
     local_dsn = dsn(dbname=default_db_name, user=admin_username, pw=admin_password)
@@ -353,9 +392,11 @@ def get_default_db_info(spec: ClusterSpec) -> DatabaseInfo:
 
     return DatabaseInfo(
         database_name=default_db_name,
+        owner=admin_username,
         nodes=nodes,
         hostname=hostname,
         node_name=node_name,
+        node_id=node_id,
         postgres_users=postgres_users,
         spock_dsn=spock_dsn,
         local_dsn=local_dsn,
@@ -367,13 +408,113 @@ def get_default_db_info(spec: ClusterSpec) -> DatabaseInfo:
         mode=mode,
     )
 
+def get_dbs_info(spec: ClusterSpec) -> list[DatabaseInfo]:
+
+    default_db_name = spec.get("name")
+    if not default_db_name:
+        info("ERROR: default database name not found in spec")
+        sys.exit(1)
+
+    databases = spec.get("databases")
+    if not databases:
+        info("WARNING: databases not found in spec, skipping other database initialization")
+        return []
+    
+    # Get shared info
+    nodes = spec.get("nodes")
+    if not nodes:
+        info("ERROR: nodes not found in spec")
+        sys.exit(1)
+
+    users = spec.get("users")
+    if not users:
+        info("ERROR: users not found in spec")
+        sys.exit(1)
+
+    # Extract details of this node from the spec
+    self_node = get_self_node(spec)
+    hostname = get_hostname(self_node)
+    node_name = self_node["name"]
+    node_id = self_node["id"]
+    postgres_users = dict(
+        (user["username"], user) for user in users if user["service"] == "postgres"
+    )
+
+    pgedge_pw = postgres_users.pop("pgedge", {}).get(
+        "password", os.getenv("INIT_PASSWORD")
+    )
+    if not pgedge_pw:
+        info("ERROR: pgedge user configuration not found in spec")
+        sys.exit(1)
+    admin_username, admin_password = get_admin_creds(postgres_users)
+    if not admin_username or not admin_password:
+        info("ERROR: admin user configuration not found in spec")
+        sys.exit(1)
+
+    # This DSN will be used to the internal admin connection
+    init_dbname = os.getenv("INIT_DATABASE")
+    init_username = os.getenv("INIT_USERNAME")
+    init_password = os.getenv("INIT_PASSWORD")
+    init_dsn = dsn(dbname=init_dbname, user=init_username, pw=init_password)
+    
+    # Deployment mode
+    mode = spec.get("mode", "online")
+
+    
+    dbs_info = []
+    for db in databases:
+        db_name = db.get("name")
+        db_owner = db.get("owner")
+        if not db_owner:
+            db_owner = admin_username
+        
+        # This DSN will be used for Spock subscriptions
+        spock_dsn = dsn(dbname=db_name, user="pgedge", host=hostname, pw=pgedge_pw)
+
+        # This DSN will be used for the admin connection
+        local_dsn = dsn(dbname=db_name, user=admin_username, pw=admin_password)
+
+        # This DSN will be used to the internal admin connection
+        internal_dsn = dsn(dbname=default_db_name, user="pgedge", pw=pgedge_pw)
+
+        db_info = DatabaseInfo(
+            database_name=db_name,
+            owner=db_owner,
+            nodes=nodes,
+            hostname=hostname,
+            node_name=node_name,
+            node_id=node_id,
+            postgres_users=postgres_users,
+            spock_dsn=spock_dsn,
+            local_dsn=local_dsn,
+            internal_dsn=internal_dsn,
+            pgedge_pw=pgedge_pw,
+            mode=mode,
+            # Dummy init_dsn
+            init_dsn=init_dsn,
+            init_dbname=init_dbname,
+            init_username=init_username,
+        )
+
+        dbs_info.append(db_info)
+    return dbs_info
+
 
 def init_default_database(db_info: DatabaseInfo) -> None:
-    admin_username = get_admin_creds(db_info.postgres_users)[0]
+    init_status = read_init_status()
+    default_db_initialized = init_status["default_db_initialized"]
+    if default_db_initialized:
+        info("default database already initialized, skipping")
+        return
+
+    admin_username = db_info.owner
 
     # Bootstrap users and the primary database by connecting to the "init"
     # database which is built into the Docker image
     with connect(db_info.init_dsn) as conn:
+        if not db_info.init_dsn:
+            info("ERROR: init_dsn not found in spec, skipping default database initialization")
+            sys.exit(1)
         with conn.cursor() as cur:
             cur.execute("SET log_statement = 'none';")
             stmts = [
@@ -420,7 +561,49 @@ def init_default_database(db_info: DatabaseInfo) -> None:
     # Wait for each peer to come online and then subscribe to it
     init_peer_spock_subscriptions(db_info)
 
-    info(f"database node initialized ({db_info.node_name})")
+    info(f"default database initialized ({db_info.node_name})")
+    update_default_db_init_status(True)
+
+def init_database(db_info: DatabaseInfo) -> None:
+    init_status = read_init_status()
+    if db_info.database_name in init_status["dbs_initialized"]:
+        info(f"database {db_info.database_name} already initialized, skipping")
+        return
+    # Check if database exists and create if it doesn't
+    with connect(db_info.internal_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET log_statement = 'none';")
+            # Check if database exists
+            cur.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s",
+                (db_info.database_name,)
+            )
+            db_exists = cur.fetchone() is not None
+            
+            if not db_exists:
+                # Create the database if it doesn't exist
+                cur.execute(f"CREATE DATABASE {db_info.database_name} OWNER {db_info.owner};")
+                info(f"created database {db_info.database_name}")
+            else:
+                info(f"database {db_info.database_name} already exists")
+            
+            # Grant permissions regardless of whether we just created the database
+            stmts = [
+                f"GRANT ALL PRIVILEGES ON DATABASE {db_info.database_name} TO {db_info.owner};",
+                f"GRANT ALL PRIVILEGES ON DATABASE {db_info.database_name} TO pgedge;",
+            ]
+            for statement in stmts:
+                cur.execute(statement)
+    
+    info(f"successfully configured database {db_info.database_name}")
+
+    # Create the spock node
+    schemas = ["public", "spock", "pg_catalog", "information_schema"]
+    init_spock_node(db_info, schemas)
+    time.sleep(5)
+    # Initialize peer subscriptions
+    init_peer_spock_subscriptions(db_info)
+    update_database_init_status(db_info.database_name, True)
 
 
 def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = False) -> None:
@@ -445,7 +628,7 @@ def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = F
 
 def init_spock_node(db_info: DatabaseInfo, schemas: list[str]) -> None:
 
-    with connect(db_info.internal_dsn, autocommit=False) as conn:
+    with connect(db_info.spock_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute("SET log_statement = 'none';")
             stmts = [
@@ -477,7 +660,7 @@ def init_spock_node(db_info: DatabaseInfo, schemas: list[str]) -> None:
             for statement in stmts:
                 cur.execute(statement)
 
-    with connect(db_info.internal_dsn, autocommit=False) as conn:
+    with connect(db_info.spock_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute("SET log_statement = 'none';")
             stmts = []
@@ -515,6 +698,13 @@ def main() -> None:
         else:
             info("initializing database node...")
             init_default_database(default_db_info)
+    
+    # Initialize the other databases
+    dbs_info = get_dbs_info(spec)
+    for db_info in dbs_info:
+        init_database(db_info)
+    
+    info(f"database node initialized ({db_info.node_name})")
 
 
 if __name__ == "__main__":

@@ -29,8 +29,8 @@ if [[ ! -f "${PGCONF}" ]]; then
 fi
 
 # Detect the database specification file
-if [[ -f "/home/pgedge/db.json" ]]; then
-    SPEC_PATH="/home/pgedge/db.json"
+if [[ -f "/home/pgedge/cluster.json" ]]; then
+    SPEC_PATH="/home/pgedge/cluster.json"
 fi
 
 NODE_NAME=${NODE_NAME:-n1}
@@ -42,7 +42,7 @@ if [[ -n "${SPEC_PATH}" ]]; then
     if [[ "${IS_SETUP}" = "1" ]]; then
         # Write the database name as cron.database_name in the configuration file
         NAME=$(jq -r ".name" "${SPEC_PATH}")
-        echo "**** pgEdge: database name is ${NAME} ****"
+        echo "**** pgEdge: default database name is ${NAME} ****"
         echo "cron.database_name = '${NAME}'" >>${PGCONF}
         # If NODE_ID is set, use it as the snowflake node id
         if [[ -n "${NODE_ID}" ]]; then
