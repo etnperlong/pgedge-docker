@@ -143,8 +143,8 @@ def spock_sub_create(cursor: Cursor, sub_name: str, other_dsn: str):
         provider_dsn := '{other_dsn}',
         replication_sets := '{replication_sets}',
         forward_origins := '{forward_origins}',
-        synchronize_structure := 'false',
-        synchronize_data := 'false',
+        synchronize_structure := 'true',
+        synchronize_data := 'true',
         apply_delay := '0'
     );"""
     # Retry until it works
@@ -282,10 +282,9 @@ def get_hostname(node: NodeSpec) -> str:
 @dataclass
 class DatabaseInfo:
     database_name: str
-    database_id: str
     hostname: str
     mode: Optional[str]
-    nodes: list[dict[str, Any]]
+    nodes: list[NodeSpec]
     node_name: str
     postgres_users: dict[str, Any]
     spock_dsn: str
@@ -297,13 +296,11 @@ class DatabaseInfo:
     pgedge_pw: str
 
 
-def get_db_info(spec: ClusterSpec) -> DatabaseInfo:
-    database_name = spec.get("name")
-    if not database_name:
-        info("ERROR: database name not found in spec")
+def get_default_db_info(spec: ClusterSpec) -> DatabaseInfo:
+    default_db_name = spec.get("name")
+    if not default_db_name:
+        info("ERROR: default database name not found in spec")
         sys.exit(1)
-
-    database_id = spec.get("id", "default")
 
     nodes = spec.get("nodes")
     if not nodes:
@@ -337,22 +334,25 @@ def get_db_info(spec: ClusterSpec) -> DatabaseInfo:
         sys.exit(1)
 
     # This DSN will be used for Spock subscriptions
-    spock_dsn = dsn(dbname=database_name, user="pgedge", host=hostname)
+    spock_dsn = dsn(dbname=default_db_name, user="pgedge", host=hostname)
 
     # This DSN will be used for the admin connection
-    local_dsn = dsn(dbname=database_name, user=admin_username, pw=admin_password)
+    local_dsn = dsn(dbname=default_db_name, user=admin_username, pw=admin_password)
 
     # This DSN will be used to the internal admin connection
-    internal_dsn = dsn(dbname=database_name, user="pgedge", pw=pgedge_pw)
+    internal_dsn = dsn(dbname=default_db_name, user="pgedge", pw=pgedge_pw)
 
+    # This DSN will be used to the internal admin connection
     init_dbname = os.getenv("INIT_DATABASE")
     init_username = os.getenv("INIT_USERNAME")
     init_password = os.getenv("INIT_PASSWORD")
     init_dsn = dsn(dbname=init_dbname, user=init_username, pw=init_password)
 
+    # Deployment mode
+    mode = spec.get("mode", "online")
+
     return DatabaseInfo(
-        database_name=database_name,
-        database_id=database_id,
+        database_name=default_db_name,
         nodes=nodes,
         hostname=hostname,
         node_name=node_name,
@@ -364,29 +364,11 @@ def get_db_info(spec: ClusterSpec) -> DatabaseInfo:
         init_dbname=init_dbname,
         init_username=init_username,
         pgedge_pw=pgedge_pw,
-        mode=spec.get("mode", "online"),
+        mode=mode,
     )
 
-def init_online_mode(db_info: DatabaseInfo) -> None:
-    # Give Postgres a moment to start
-    time.sleep(3)
 
-    initialized = not can_connect(db_info.init_dsn) and can_connect(db_info.local_dsn)
-
-    if initialized:
-        info("database node already initialized")
-    else:
-        info("initializing database node")
-        init_database(db_info)
-
-
-def init_offline_mode() -> None:
-    info("mode offline configured, postgres will not start")
-    while True:
-        time.sleep(1)
-
-
-def init_database(db_info: DatabaseInfo) -> None:
+def init_default_database(db_info: DatabaseInfo) -> None:
     admin_username = get_admin_creds(db_info.postgres_users)[0]
 
     # Bootstrap users and the primary database by connecting to the "init"
@@ -442,7 +424,7 @@ def init_database(db_info: DatabaseInfo) -> None:
 
 
 def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = False) -> None:
-    peers = [node for node in db_info.nodes if node["name"] != db_info.node_name]
+    peers = [node for node in db_info.nodes if node["id"] != db_info.node_id]
     with connect(db_info.local_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
             for peer in peers:
@@ -452,7 +434,7 @@ def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = F
                     user="pgedge",
                     host=get_hostname(peer),
                 )
-                sub_name = f"sub_{db_info.node_name}{peer['name']}"
+                sub_name = f"sub_{db_info.node_name}_{peer['name']}"
                 wait_for_spock_node(peer_dsn)
                 if drop_existing:
                     spock_sub_drop(cur, sub_name)
@@ -516,12 +498,23 @@ def main() -> None:
         sys.exit(1)
 
     # Parse the spec so we can pass it around
-    db_info = get_db_info(spec)
+    default_db_info = get_default_db_info(spec)
 
-    if db_info.mode == "offline":
-        init_offline_mode()
+    if default_db_info.mode == "offline":
+        info("mode offline configured, postgres will not start")
+        while True:
+            time.sleep(1)
     else:
-        init_online_mode(db_info)
+        # Give Postgres a moment to start
+        time.sleep(3)
+
+        initialized = not can_connect(default_db_info.init_dsn) and can_connect(default_db_info.local_dsn)
+
+        if initialized:
+            info("database node already initialized, skipping initialization.")
+        else:
+            info("initializing database node...")
+            init_default_database(default_db_info)
 
 
 if __name__ == "__main__":
