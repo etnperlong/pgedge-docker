@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum
 import json
 import os
 import sys
@@ -80,33 +81,33 @@ def read_config() -> ClusterSpec:
     with open(CLUSTER_CONF_FILE) as f:
         return json.load(f)
 
+class DatabaseStatus(str, Enum):
+    CREATED = "created"      # Database is created but not initialized
+    INITED = "inited"       # Database is initialized with extensions and basic setup
+    SUBSCRIBED = "subscribed"  # Database has all peer subscriptions set up
+
 class InitStatus(TypedDict):
     default_db_initialized: bool
-    dbs_initialized: List[str]
+    dbs_initialized: dict[str, DatabaseStatus]
 
 def read_init_status():
     # Force update from enviroment
     force_update = os.getenv("FORCE_INIT", "false").lower() == "true"
     if force_update:
         info("WARNING: FORCE_INIT is set, forcing init status update")
-        return {"default_db_initialized": False, "dbs_initialized": []}
+        return {"default_db_initialized": False, "dbs_initialized": {}}
     if not os.path.exists(INIT_STATUS_FILE):
-        return {"default_db_initialized": False, "dbs_initialized": []}
+        return {"default_db_initialized": False, "dbs_initialized": {}}
     with open(INIT_STATUS_FILE) as f:
         # If not a valid json, return empty
         try:
             return json.load(f)
         except json.JSONDecodeError:
-            return {"default_db_initialized": False, "dbs_initialized": []}
+            return {"default_db_initialized": False, "dbs_initialized": {}}
     
-def update_database_init_status(database_name: str, initialized: bool) -> None:
+def update_database_init_status(database_name: str, status: DatabaseStatus) -> None:
     init_status = read_init_status()
-    if initialized:
-        if database_name not in init_status["dbs_initialized"]:
-            init_status["dbs_initialized"].append(database_name)
-    else:
-        if database_name in init_status["dbs_initialized"]:
-            init_status["dbs_initialized"].remove(database_name)
+    init_status["dbs_initialized"][database_name] = status
     with open(INIT_STATUS_FILE, "w") as f:
         json.dump(init_status, f)
 
@@ -559,16 +560,20 @@ def init_default_database(db_info: DatabaseInfo) -> None:
     time.sleep(5)
 
     # Wait for each peer to come online and then subscribe to it
-    init_peer_spock_subscriptions(db_info)
-
-    info(f"default database initialized ({db_info.node_name})")
-    update_default_db_init_status(True)
+    subscribed = init_peer_spock_subscriptions(db_info, True)
+    if not subscribed:
+        info(f"No need to subscribe to peers for {db_info.database_name}, skipping")
+    else:
+        info(f"default database initialized ({db_info.node_name})")
+        update_default_db_init_status(True)
 
 def init_database(db_info: DatabaseInfo) -> None:
     init_status = read_init_status()
-    if db_info.database_name in init_status["dbs_initialized"]:
-        info(f"database {db_info.database_name} already initialized, skipping")
+    current_status = init_status["dbs_initialized"].get(db_info.database_name)
+    if current_status is not None:
+        info(f"database {db_info.database_name} already fully initialized, skipping")
         return
+
     # Check if database exists and create if it doesn't
     with connect(db_info.internal_dsn) as conn:
         with conn.cursor() as cur:
@@ -595,19 +600,15 @@ def init_database(db_info: DatabaseInfo) -> None:
             for statement in stmts:
                 cur.execute(statement)
     
+    update_database_init_status(db_info.database_name, DatabaseStatus.CREATED)
     info(f"successfully configured database {db_info.database_name}")
 
-    # Create the spock node
-    schemas = ["public", "spock", "pg_catalog", "information_schema"]
-    init_spock_node(db_info, schemas)
-    time.sleep(5)
-    # Initialize peer subscriptions
-    init_peer_spock_subscriptions(db_info)
-    update_database_init_status(db_info.database_name, True)
 
-
-def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = False) -> None:
+def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = False) -> bool:
     peers = [node for node in db_info.nodes if node["id"] != db_info.node_id]
+    if len(peers) == 0:
+        info(f"no peers found for database {db_info.database_name}, skipping peer spock subscriptions")
+        return False
     with connect(db_info.local_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
             for peer in peers:
@@ -617,15 +618,17 @@ def init_peer_spock_subscriptions(db_info: DatabaseInfo, drop_existing: bool = F
                     user="pgedge",
                     host=get_hostname(peer),
                 )
-                sub_name = f"sub_{db_info.node_name}_{peer['name']}"
+                sub_name = f"sub_{db_info.database_name}_{db_info.node_name}_{peer['name']}"
                 wait_for_spock_node(peer_dsn)
                 if drop_existing:
                     spock_sub_drop(cur, sub_name)
+                time.sleep(2)
                 spock_sub_create(
                     cur, sub_name, peer_dsn
                 )
                 info("subscribed to peer:", peer["name"])
-
+            return True
+    return False
 def init_spock_node(db_info: DatabaseInfo, schemas: list[str]) -> None:
 
     with connect(db_info.spock_dsn, autocommit=False) as conn:
@@ -704,7 +707,39 @@ def main() -> None:
     for db_info in dbs_info:
         init_database(db_info)
     
-    info(f"database node initialized ({db_info.node_name})")
+    # Init spock node for all databases
+    schemas = ["public", "spock", "pg_catalog", "information_schema"]
+    for db_info in dbs_info:
+        init_status = read_init_status()
+        current_status = init_status["dbs_initialized"].get(db_info.database_name)
+        if current_status is None: 
+            info(f"database {db_info.database_name} not initialized, something went wrong! Please restart the node.")
+            sys.exit(1)
+        elif current_status == DatabaseStatus.CREATED:
+            info(f"database {db_info.database_name} created, initializing spock node")
+            init_spock_node(db_info, schemas)
+            update_database_init_status(db_info.database_name, DatabaseStatus.INITED)
+            time.sleep(5)
+            info(f"spock node of {db_info.database_name} initialized.")
+        else:
+            info(f"database spock node {db_info.database_name} already initialized, skipping")
+
+    # Init peer subscriptions for all databases
+    for db_info in dbs_info:
+        init_status = read_init_status()
+        current_status = init_status["dbs_initialized"].get(db_info.database_name)
+        if current_status == DatabaseStatus.SUBSCRIBED:
+            info(f"database {db_info.database_name} already subscribed to peers, skipping")
+        else:
+            info(f"database {db_info.database_name} not subscribed to peers, subscribing")
+            subscribed = init_peer_spock_subscriptions(db_info, True)
+            if subscribed:
+                update_database_init_status(db_info.database_name, DatabaseStatus.SUBSCRIBED)
+                info(f"database {db_info.database_name} subscribed to peers")
+            else:
+                info(f"No need to subscribe to peers for {db_info.database_name}, skipping")
+
+    info(f"cluster node initialized ({db_info.node_name})")
 
 
 if __name__ == "__main__":
