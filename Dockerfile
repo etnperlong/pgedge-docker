@@ -99,6 +99,13 @@ RUN PGEDGE_CONF="${PGDATA}/postgresql.conf"; \
     && sed -i "s/^#\?logging_collector.*/logging_collector = 'off'/g" ${PGEDGE_CONF} \
     && sed -i "s/^#\?log_connections.*/log_connections = 'off'/g" ${PGEDGE_CONF} \
     && sed -i "s/^#\?log_disconnections.*/log_disconnections = 'off'/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?max_worker_processes.*/max_worker_processes = 256/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?max_parallel_workers_per_gather.*/max_parallel_workers_per_gather = 16/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?max_parallel_maintenance_workers.*/max_parallel_maintenance_workers = 16/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?max_parallel_workers.*/max_parallel_workers = 64/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?max_wal_senders.*/max_wal_senders = 128/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?max_replication_slots.*/max_replication_slots = 128/g" ${PGEDGE_CONF} \
+    && sed -i "s/^#\?wal_sender_timeout.*/wal_sender_timeout = '8s'/g" ${PGEDGE_CONF} \
     && sed -i "s/scram-sha-256/md5/g" ${PGEDGE_HBA}
 
 # Now it's safe to set PGDATA to the intended runtime value
