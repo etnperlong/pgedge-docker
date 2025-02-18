@@ -1,2 +1,4 @@
 /data
 /examples/swarm/data
+venv/
+init-status.json
