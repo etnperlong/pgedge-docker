@@ -2,6 +2,8 @@ name: Build Docker images
 
 on:
   push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*' # 匹配 v1.2.3 和 v1.2.3-beta.1 等格式
 
 env:
   DOCKERHUB_REPO: etnperlong/pgedge
