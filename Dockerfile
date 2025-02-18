@@ -1,3 +1,10 @@
+# Extension binary
+ARG PGV="17"
+FROM pgvector/pgvector:pg${PGV} AS pgvector
+FROM alexbob/postgres:${PGV}-zhparser AS zhparser
+
+# Build stage
+
 FROM rockylinux/rockylinux:9.4-ubi
 
 ARG TARGETARCH
@@ -77,13 +84,20 @@ RUN ./pgedge/pgedge setup -U ${INIT_USERNAME} -d ${INIT_DATABASE} -P ${INIT_PASS
     && ./pgedge/pgedge um install postgis \
     && pg_ctl stop -t 60 --wait
 
+# Fix pgvector extension by replacing the pgvector extension to the pgvector image
+COPY --from=pgvector /usr/lib/postgresql/${PGV}/lib/vector.so /opt/pgedge/pg${PGV}/lib/postgresql/vector.so
 
-
+# Add zhparser extension
+COPY --from=zhparser /usr/lib/postgresql/${PGV}/lib/zhparser.so /opt/pgedge/pg${PGV}/lib/postgresql/zhparser.so
+COPY --from=zhparser /usr/local/lib/libscws.* /opt/pgedge/pg${PGV}/lib/
+COPY --from=zhparser /usr/share/postgresql/${PGV}/extension/zhparser* /opt/pgedge/pg${PGV}/share/postgresql/extension/
+COPY --from=zhparser /usr/lib/postgresql/${PGV}/lib/bitcode/zhparser* /opt/pgedge/pg${PGV}/lib/postgresql/bitcode/
+COPY --from=zhparser /usr/share/postgresql/${PGV}/tsearch_data/*.utf8.* /opt/pgedge/pg${PGV}/share/postgresql/tsearch_data/
 
 # Customize some Postgres configuration settings in the image. You may want to
 # further customize these at runtime.
 ARG SHARED_BUFFERS="512MB"
-ARG MAINTENANCE_WORK_MEM="128MB"
+ARG MAINTENANCE_WORK_MEM="256MB"
 ARG EFFECTIVE_CACHE_SIZE="1024MB"
 ARG LOG_DESTINATION="stderr"
 ARG LOG_STATEMENT="ddl"
